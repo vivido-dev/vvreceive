@@ -1,16 +1,16 @@
 [package]
 name = "vvreceive"
-version = "0.1.0"
+version = "0.1.4"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
-rust-version = "1.87.0"
-description = "Linux receiver for authenticated Vivid file drops"
+rust-version = "1.88"
+description = "Linux and macOS receiver for authenticated Vivid file drops"
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/vivido-dev/vvreceive"
 
 [dependencies]
-cap-std = "3.4"
+cap-std = "4"
 getrandom = "0.4"
 libc = "0.2"
 sha2 = "0.11"
@@ -20,6 +20,6 @@ vivid_protocol = { version = "1.5", path = "../vivid_protocol", default-features
 vivid_sdk = { version = "1.5", path = "../vivid_sdk", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "net", "process"] }
 
 [workspace]
