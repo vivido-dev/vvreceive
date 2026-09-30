@@ -82,7 +82,10 @@ the local filename into the PTY.
 `vvreceive` is not a daemon. It is started once per `vvssh` login shell, records that shell's
 process start time from `/proc/<pid>/stat`, and exits as soon as the shell does. Comparing the
 start time rather than the PID alone means a recycled PID cannot inherit a live receiver. On exit
-it disables its file-drop binding so the presenter stops offering drops immediately.
+it disables its file-drop binding when control is available. An independent lifetime watcher
+cancels control and bulk sockets when the shell exits; control loss also cancels bulk I/O.
+Bulk reads enforce the negotiated idle timeout locally, and the receiver rechecks lifetime
+before committing. Destination failures settle through an I/O result or owner-scoped cancellation.
 
 ## Limits
 
@@ -107,7 +110,14 @@ Desktop producers reuse the receive half without the shell-cwd logic:
   path: a desktop drop has no terminal to type into.
 - `reconcile_committed` — settle a physically committed drop whose protocol result was lost,
   advancing a generation and replying `already committed` rather than ever creating a second file.
+- `reconcile_committed_pending` — borrow the committed state so a control loop can retain and
+  retry it after a transient error. vvland and vvdesk retain pending outcomes for up to 60 seconds
+  without terminating the desktop session. Failed receipt workers request control cancellation.
 - `open_xdg_desktop` — resolve the XDG Desktop directory (Linux only).
+
+Portable receipt replenishes the actual channel credit grant. Disk writes update SHA-256 for
+each successfully written prefix, including before an error. The Linux receiver resolves the
+retained destination directory's current path after commit and caches that path for replay.
 
 [`vvland`](https://github.com/vivido-dev/vvland) and `vvdesk` use these to accept drops onto an
 isolated desktop surface.

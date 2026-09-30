@@ -22,7 +22,6 @@ use vivid_sdk::{
 /// control requests while bulk data and disk I/O remain on an independent worker.
 pub struct CommittedFileDrop {
     final_name: String,
-    offer: FileDropOffer,
     result: FileResult,
     channel: vivid_sdk::IncomingFileTransfer,
     request: IncomingFileTransferRequest,
@@ -38,23 +37,64 @@ pub fn receive_accepted(
     offer: FileDropOffer,
     directory: File,
 ) -> io::Result<CommittedFileDrop> {
+    receive_to_directory(&mut channel, &offer, directory, || Ok(())).map(|(final_name, sha256)| {
+        let result = FileResult {
+            transfer_id: channel.request().transfer_id,
+            transfer_generation: channel.request().transfer_generation,
+            result: FileResultCode::Committed,
+            committed_length: offer.declared_length,
+            final_name: final_name.clone(),
+            committed_path: None,
+        };
+        // Delivery is not acknowledgement; retain the exact result for control reconciliation.
+        let _ = channel.send_result(&result);
+        CommittedFileDrop {
+            request: channel.request(),
+            result,
+            final_name,
+            channel,
+            sha256,
+        }
+    })
+}
+
+fn failure_result(channel: &vivid_sdk::IncomingFileTransfer, code: FileResultCode) {
     let request = channel.request();
+    let _ = channel.send_result(&FileResult {
+        transfer_id: request.transfer_id,
+        transfer_generation: request.transfer_generation,
+        result: code,
+        committed_length: 0,
+        final_name: String::new(),
+        committed_path: None,
+    });
+}
+
+fn receive_to_directory(
+    channel: &mut vivid_sdk::IncomingFileTransfer,
+    offer: &FileDropOffer,
+    directory: File,
+    check_live: impl Fn() -> io::Result<()>,
+) -> io::Result<(String, [u8; 32])> {
     let directory = Dir::from_std_file(directory);
-    let mut random = [0_u8; 16];
-    getrandom::fill(&mut random).map_err(io::Error::other)?;
-    let temporary_name = format!(".vivid-drop-{}", portable_hex(&random));
-    let mut options = CapOpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut temporary = directory.open_with(&temporary_name, &options)?;
+    let mut temporary_name = None;
+    let mut failure = FileResultCode::IoError;
     let result = (|| {
+        check_live().inspect_err(|_| failure = FileResultCode::Cancelled)?;
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(io::Error::other)?;
+        let name = format!(".vivid-drop-{}", portable_hex(&random));
+        let mut options = CapOpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut temporary = directory.open_with(&name, &options)?;
+        temporary_name = Some(name.clone());
         let mut hasher = Sha256::new();
-        let mut received_body = 0_u64;
-        let mut received_records = 0_u64;
-        let mut maximum_body = 16 * 1024 * 1024_u64;
-        let mut maximum_records = 32_u64;
-        let finish = loop {
+        let mut credit = Credit::new(channel.request());
+        credit.start(channel)?;
+        loop {
+            check_live().inspect_err(|_| failure = FileResultCode::Cancelled)?;
             match channel.read_event()? {
                 IncomingFileTransferEvent::Data { offset, bytes } => {
                     if temporary.stream_position()? != offset {
@@ -63,167 +103,279 @@ pub fn receive_accepted(
                             "temporary offset mismatch",
                         ));
                     }
-                    temporary.write_all(&bytes)?;
-                    hasher.update(&bytes);
-                    received_body = received_body
-                        .checked_add(bytes.len() as u64 + 16)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "credit overflow")
-                        })?;
-                    received_records = received_records.checked_add(1).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "credit overflow")
-                    })?;
-                    if maximum_body.saturating_sub(received_body) < 4 * 1024 * 1024
-                        || maximum_records.saturating_sub(received_records) < 4
-                    {
-                        maximum_body =
-                            maximum_body.checked_add(16 * 1024 * 1024).ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::InvalidData, "credit overflow")
-                            })?;
-                        maximum_records = maximum_records.checked_add(32).ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "credit overflow")
-                        })?;
-                        channel.grant(maximum_body, maximum_records)?;
-                    }
+                    write_hashed(&mut temporary, &mut hasher, &bytes)?;
+                    credit.received(bytes.len(), channel)?;
                 }
-                IncomingFileTransferEvent::Finished(finish) => break finish,
+                IncomingFileTransferEvent::Finished(finish) => {
+                    let actual: [u8; 32] = hasher.finalize().into();
+                    if actual != finish.sha256 {
+                        failure = FileResultCode::HashMismatch;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "file hash mismatch",
+                        ));
+                    }
+                    temporary.sync_all()?;
+                    check_live().inspect_err(|_| failure = FileResultCode::Cancelled)?;
+                    for collision in 0..10_000 {
+                        let candidate = collision_name(&offer.suggested_name, collision);
+                        match directory.hard_link(&name, &directory, &candidate) {
+                            Ok(()) => return Ok((candidate, actual)),
+                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "collision limit reached",
+                    ));
+                }
                 IncomingFileTransferEvent::Aborted(_) => {
+                    failure = FileResultCode::Cancelled;
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "sender aborted",
                     ));
                 }
             }
-        };
-        let actual: [u8; 32] = hasher.finalize().into();
-        if actual != finish.sha256 {
-            channel.send_result(&FileResult {
-                transfer_id: finish.transfer_id,
-                transfer_generation: finish.transfer_generation,
-                result: FileResultCode::HashMismatch,
-                committed_length: temporary.stream_position()?,
-                final_name: String::new(),
-                committed_path: None,
-            })?;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "file hash mismatch",
-            ));
         }
-        temporary.sync_all()?;
-        for collision in 0..10_000 {
-            let candidate = collision_name(&offer.suggested_name, collision);
-            match directory.hard_link(&temporary_name, &directory, &candidate) {
-                Ok(()) => {
-                    // The no-replace hard link is the atomic commit point. Failure to unlink the
-                    // now-redundant temporary name must not turn a committed file into an unknown
-                    // outcome; the outer cleanup retries it.
-                    let _ = directory.remove_file(&temporary_name);
-                    let result = FileResult {
-                        transfer_id: finish.transfer_id,
-                        transfer_generation: finish.transfer_generation,
-                        result: FileResultCode::Committed,
-                        committed_length: offer.declared_length,
-                        final_name: candidate.clone(),
-                        // A desktop drop has no terminal to type into, so this portable path
-                        // never discloses a destination. Only the shell-cwd receiver does.
-                        committed_path: None,
-                    };
-                    // A successful write is not an acknowledgement. The control-loop must QUERY
-                    // the cached outcome, and may advance/replay the finish if this write was lost.
-                    let _ = channel.send_result(&result);
-                    return Ok(CommittedFileDrop {
-                        final_name: candidate,
-                        offer,
-                        result,
-                        channel,
-                        request,
-                        sha256: actual,
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "collision limit reached",
-        ))
     })();
-    let _ = directory.remove_file(&temporary_name);
+    if let Some(name) = temporary_name {
+        let _ = directory.remove_file(name);
+    }
+    if result.is_err() {
+        failure_result(channel, failure);
+    }
     result
 }
 
-/// Reconcile a committed desktop file without ever creating a second destination file.
+// Hash each successfully written prefix, so a partial write and subsequent error cannot
+// separate the file position from the retained hash state.
+fn write_hashed(writer: &mut impl Write, hasher: &mut Sha256, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "temporary write made no progress",
+                ));
+            }
+            Ok(n) => {
+                hasher.update(&bytes[..n]);
+                bytes = &bytes[n..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+struct Credit {
+    body: u64,
+    records: u64,
+    window_body: u64,
+    window_records: u64,
+    used_body: u64,
+    used_records: u64,
+    record_body: u64,
+}
+
+impl Credit {
+    fn new(request: IncomingFileTransferRequest) -> Self {
+        Self {
+            body: request.maximum_body_bytes,
+            records: request.maximum_records,
+            window_body: request
+                .maximum_body_bytes
+                .max(u64::from(request.maximum_record_body)),
+            window_records: request.maximum_records.max(1),
+            used_body: 0,
+            used_records: 0,
+            record_body: u64::from(request.maximum_record_body),
+        }
+    }
+
+    fn start(&mut self, channel: &mut vivid_sdk::IncomingFileTransfer) -> io::Result<()> {
+        if self.body < self.record_body || self.records == 0 {
+            self.body = self.body.max(self.record_body);
+            self.records = self.records.max(1);
+            channel.grant(self.body, self.records)?;
+        }
+        Ok(())
+    }
+
+    fn account(&mut self, length: usize) -> io::Result<Option<(u64, u64)>> {
+        let overflow = || io::Error::new(io::ErrorKind::InvalidData, "credit overflow");
+        self.used_body = self
+            .used_body
+            .checked_add(
+                u64::try_from(length)
+                    .map_err(|_| overflow())?
+                    .checked_add(16)
+                    .ok_or_else(overflow)?,
+            )
+            .ok_or_else(overflow)?;
+        self.used_records = self.used_records.checked_add(1).ok_or_else(overflow)?;
+        if self.body.saturating_sub(self.used_body) < self.record_body
+            || self.records.saturating_sub(self.used_records) == 0
+        {
+            self.body = self
+                .body
+                .checked_add(self.window_body)
+                .ok_or_else(overflow)?;
+            self.records = self
+                .records
+                .checked_add(self.window_records)
+                .ok_or_else(overflow)?;
+            Ok(Some((self.body, self.records)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn received(
+        &mut self,
+        length: usize,
+        channel: &mut vivid_sdk::IncomingFileTransfer,
+    ) -> io::Result<()> {
+        if let Some((body, records)) = self.account(length)? {
+            channel.grant(body, records)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reconcile a physically committed file. Transport failures leave the committed file intact.
+/// Callers needing to retry an uncertain result can retain it with `reconcile_committed_pending`.
 pub fn reconcile_committed(
     session: &Session,
     mut committed: CommittedFileDrop,
 ) -> io::Result<String> {
-    const ATTEMPTS: u32 = 3;
-    for attempt in 0..ATTEMPTS {
-        let mut known_nonterminal = false;
-        for _ in 0..3 {
-            match session.query_file_drop(
-                QueryFileDrop {
-                    drop_id: committed.offer.binding.drop_id,
+    reconcile_committed_pending(session, &mut committed)?;
+    Ok(committed.final_name)
+}
+
+/// Settle a committed result without consuming the state on a transient failure.
+pub fn reconcile_committed_pending(
+    session: &Session,
+    committed: &mut CommittedFileDrop,
+) -> io::Result<()> {
+    reconcile(session, committed)
+}
+
+fn committed_status(
+    status: &vivid_sdk::FileDropStatus,
+    committed: &CommittedFileDrop,
+) -> io::Result<bool> {
+    let request = committed.request;
+    if status.drop_id != request.drop_id || status.transfer_id != request.transfer_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file-drop status identity mismatch",
+        ));
+    }
+    match status.state {
+        FileDropState::Committed
+            if status.final_name == committed.final_name
+                && status.committed_offset == request.declared_length
+                && matches!(
+                    status.result,
+                    Some(FileResultCode::Committed | FileResultCode::AlreadyCommitted)
+                ) =>
+        {
+            Ok(true)
+        }
+        FileDropState::Accepted | FileDropState::Transferring => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file-drop status has a conflicting terminal outcome",
+        )),
+    }
+}
+
+fn reconcile(session: &Session, committed: &mut CommittedFileDrop) -> io::Result<()> {
+    let mut last_error = io::Error::other("could not reconcile the committed file result");
+    for attempt in 0..6 {
+        let _ = committed.channel.send_result(&committed.result);
+        let status = match session.query_file_drop(
+            QueryFileDrop {
+                drop_id: committed.request.drop_id,
+            },
+            &RequestMetadata::default(),
+        ) {
+            Ok(status) => status,
+            Err(error) => {
+                last_error = error;
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+        if committed_status(&status, committed)? {
+            return Ok(());
+        }
+        if attempt == 5 {
+            break;
+        }
+        // The reply may follow a successful but unacknowledged advance. Adopt its generation
+        // rather than repeatedly advancing from the stale local generation.
+        if status.generation == committed.request.transfer_generation {
+            let generation = status.generation.advance()?;
+            match session.advance_file_transfer(
+                AdvanceFileTransfer {
+                    context_id: committed.request.context_id,
+                    surface_id: committed.request.surface_id,
+                    drop_id: committed.request.drop_id,
+                    transfer_id: committed.request.transfer_id,
+                    expected_generation: status.generation,
+                    new_generation: generation,
+                    committed_offset: committed.request.declared_length,
+                    maximum_body_bytes: committed.request.maximum_body_bytes,
+                    maximum_records: committed.request.maximum_records,
                 },
                 &RequestMetadata::default(),
             ) {
-                Ok(status)
-                    if status.state == FileDropState::Committed
-                        && status.final_name == committed.final_name
-                        && status.committed_offset == committed.offer.declared_length =>
+                Ok(_) => committed.request.transfer_generation = generation,
+                Err(error) => {
+                    last_error = error;
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            }
+        } else if status.generation == committed.request.transfer_generation.advance()? {
+            committed.request.transfer_generation = status.generation;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file-drop status generation mismatch",
+            ));
+        }
+        committed.request.resume_offset = committed.request.declared_length;
+        match session.open_incoming_file_transfer(committed.request) {
+            Ok(mut channel) => match channel.read_event() {
+                Ok(IncomingFileTransferEvent::Finished(finish))
+                    if finish.sha256 == committed.sha256
+                        && finish.final_length == committed.request.declared_length =>
                 {
-                    return Ok(committed.final_name);
+                    committed.channel = channel;
+                    committed.result.transfer_generation = committed.request.transfer_generation;
+                    committed.result.result = FileResultCode::AlreadyCommitted;
                 }
                 Ok(_) => {
-                    known_nonterminal = true;
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "committed replay changed finish",
+                    ));
                 }
-                Err(_) => thread::sleep(Duration::from_millis(20)),
-            }
-        }
-        if !known_nonterminal || attempt + 1 == ATTEMPTS {
-            break;
-        }
-
-        let previous = committed.request.transfer_generation;
-        let generation = previous.advance()?;
-        session.advance_file_transfer(
-            AdvanceFileTransfer {
-                context_id: committed.request.context_id,
-                surface_id: committed.request.surface_id,
-                drop_id: committed.request.drop_id,
-                transfer_id: committed.request.transfer_id,
-                expected_generation: previous,
-                new_generation: generation,
-                committed_offset: committed.offer.declared_length,
-                maximum_body_bytes: committed.request.maximum_body_bytes,
-                maximum_records: committed.request.maximum_records,
+                Err(error) => last_error = error,
             },
-            &RequestMetadata::default(),
-        )?;
-        committed.request.transfer_generation = generation;
-        committed.request.resume_offset = committed.offer.declared_length;
-        committed.channel = session.open_incoming_file_transfer(committed.request)?;
-        match committed.channel.read_event()? {
-            IncomingFileTransferEvent::Finished(finish)
-                if finish.final_length == committed.offer.declared_length
-                    && finish.sha256 == committed.sha256 => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "committed transfer replay was not an identical finish",
-                ));
-            }
+            Err(error) => last_error = error,
         }
-        committed.result.transfer_generation = generation;
-        committed.result.result = FileResultCode::AlreadyCommitted;
-        let _ = committed.channel.send_result(&committed.result);
+        // Always query again, including after failed advance/open/read: the original result
+        // may have become terminal concurrently on the independent bulk connection.
+        thread::sleep(Duration::from_millis(20));
     }
-    Err(io::Error::other(
-        "could not reconcile the committed file result",
-    ))
+    Err(last_error)
 }
 
 fn collision_name(name: &str, collision: u32) -> String {
@@ -279,23 +431,25 @@ fn portable_hex(bytes: &[u8]) -> String {
     output
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
-    use std::fs::{File, OpenOptions};
-    use std::io::{self, Seek, SeekFrom, Write};
-    use std::os::fd::{AsFd, AsRawFd};
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::path::{Path, PathBuf};
+#[cfg(unix)]
+mod transport;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod os;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod platform {
+    use std::fs::File;
+    use std::io::{self, Seek, SeekFrom};
+    use std::path::PathBuf;
     use std::thread;
     use std::time::Duration;
 
-    use rustix::fs::{RenameFlags, renameat_with};
     use sha2::{Digest, Sha256};
     use vivid_protocol::file_drop::{
         DEFAULT_ACTIVE_FILE_TRANSFERS, DEFAULT_FILE_DROP_ACCEPTANCE_US,
-        DEFAULT_FILE_TRANSFER_IDLE_US, DEFAULT_PENDING_FILE_DROPS, FileDropDestination,
-        FileDropState, FileResult, FileResultCode, MAX_COMMITTED_PATH_BYTES, QueryFileDrop,
-        validate_committed_path,
+        DEFAULT_FILE_TRANSFER_IDLE_US, DEFAULT_PENDING_FILE_DROPS, FileDropDestination, FileResult,
+        FileResultCode, validate_committed_path,
     };
     use vivid_protocol::revision::{FileTransferGeneration, SurfaceGeneration};
     use vivid_protocol::{HARD_MAX_RECORD_BODY, registry};
@@ -304,6 +458,12 @@ mod linux {
         IncomingFileTransferRequest, ProducerAuthentication, ProducerConfig, RequestMetadata,
         Session, SessionEvent,
     };
+
+    #[cfg(target_os = "macos")]
+    pub use crate::os::open_macos_desktop;
+    #[cfg(target_os = "linux")]
+    pub use crate::os::open_xdg_desktop;
+    use crate::os::{self, open_shell_cwd, process_start_time, resolve_directory};
 
     const MAXIMUM_FILE_BYTES: u64 = 1 << 40;
     const RECORD_BODY: u32 = 1024 * 1024;
@@ -327,16 +487,24 @@ mod linux {
             registry::TERMINAL_SURFACE.to_owned(),
         ];
         required_profiles.sort();
-        let session = Session::connect(ProducerConfig {
-            authentication: ProducerAuthentication::RootFromEnvironment,
-            producer_name: "vvreceive".into(),
-            producer_version: env!("CARGO_PKG_VERSION").into(),
-            target_profile: registry::TERMINAL_SURFACE.into(),
-            required_profiles,
-            // Optional, never required: an older presenter must still connect and copy.
-            optional_profiles: vec![registry::FILE_DROP_PATH.to_owned()],
-            ..ProducerConfig::default()
+        let transport = std::sync::Arc::new(crate::transport::Transport::from_env()?);
+        let _watch = crate::transport::Watch::start(transport.clone(), move || {
+            ensure_shell(shell_pid, shell_start).is_ok()
         })?;
+        let session = Session::connect_with_factory(
+            ProducerConfig {
+                authentication: ProducerAuthentication::RootFromEnvironment,
+                producer_name: "vvreceive".into(),
+                producer_version: env!("CARGO_PKG_VERSION").into(),
+                target_profile: registry::TERMINAL_SURFACE.into(),
+                required_profiles,
+                // Optional, never required: an older presenter must still connect and copy.
+                optional_profiles: vec![registry::FILE_DROP_PATH.to_owned()],
+                ..ProducerConfig::default()
+            },
+            transport.clone(),
+        )?;
+        transport.established();
         let mut binding = FileDropBindingGuard::new();
         let request = binding.enable(
             session.info().root_context_id,
@@ -351,6 +519,7 @@ mod linux {
             DEFAULT_FILE_TRANSFER_IDLE_US,
         )?;
         let grant = session.set_file_drop_binding(&request, &RequestMetadata::default())?;
+        transport.set_idle(grant.idle_timeout_us);
         binding.handle_bound(grant)?;
         // Negotiation is the whole switch: a presenter that does not want the committed path
         // typed into its terminal simply never offers this profile.
@@ -364,16 +533,23 @@ mod linux {
                         .ok_or_else(|| io::Error::other("file-drop grant is no longer active"))?;
                     if receive_offer(
                         &session,
+                        &transport,
                         shell_pid,
                         shell_start,
                         maximum_record_body,
                         disclose_path,
-                        offer,
+                        offer.clone(),
                     )
                     .is_err()
                     {
-                        // The helper has no terminal or log output by design. Per-drop failures are
-                        // reported through FILE_RESULT when a transfer connection exists.
+                        // Only uncommitted failures reach here; cancellation is owner-scoped.
+                        let _ = session.cancel_file_drop(
+                            vivid_sdk::CancelFileDrop {
+                                binding: offer.binding,
+                                reason: 0,
+                            },
+                            &RequestMetadata::default(),
+                        );
                     }
                 }
                 Some(SessionEvent::ConnectionClosed { .. }) => break,
@@ -381,12 +557,14 @@ mod linux {
             }
         }
         let _ = session.set_file_drop_binding(&binding.disable()?, &RequestMetadata::default());
-        let _ = session.close();
+        use vivid_sdk::ConnectionFactory;
+        transport.cancel();
         Ok(())
     }
 
     fn receive_offer(
         session: &Session,
+        transport: &crate::transport::Transport,
         shell_pid: u32,
         shell_start: u64,
         maximum_record_body: u32,
@@ -400,11 +578,7 @@ mod linux {
             ));
         }
         let destination = open_shell_cwd(shell_pid)?;
-        // Captured with the directory handle, at acceptance, so a later `cd` retargets neither
-        // the transfer nor the path this drop reports.
-        let destination_directory = disclose_path
-            .then(|| resolve_directory(&destination))
-            .flatten();
+        ensure_shell(shell_pid, shell_start)?;
         let mut temporary = TemporaryFile::create(destination, &offer.suggested_name)?;
         let transfer_id = session.allocate_id()?;
         let acceptance = AcceptFileDrop {
@@ -455,8 +629,21 @@ mod linux {
                             "file hash mismatch",
                         ));
                     }
-                    temporary.file.sync_all()?;
-                    let final_name = temporary.commit()?;
+                    let final_name = match (|| {
+                        temporary.file.sync_all()?;
+                        ensure_shell(shell_pid, shell_start)?;
+                        transport.ensure_live()?;
+                        temporary.commit()
+                    })() {
+                        Ok(name) => name,
+                        Err(error) => {
+                            crate::failure_result(&finish.channel, FileResultCode::IoError);
+                            return Err(error);
+                        }
+                    };
+                    let destination_directory = disclose_path
+                        .then(|| resolve_directory(&temporary.directory))
+                        .flatten();
                     let result = FileResult {
                         transfer_id,
                         transfer_generation: generation,
@@ -465,19 +652,19 @@ mod linux {
                         committed_path: committed_path(destination_directory.as_ref(), &final_name),
                         final_name: final_name.clone(),
                     };
-                    confirm_committed_result(
-                        session,
-                        &offer,
-                        transfer_id,
-                        generation,
-                        maximum_record_body,
-                        actual,
-                        result,
-                        finish.channel,
-                    )?;
+                    let _ = confirm_committed_result(session, actual, result, finish.channel);
                     return Ok(());
                 }
-                Err(error) if attempt + 1 < MAXIMUM_RESUME_ATTEMPTS => {
+                Err(error)
+                    if attempt + 1 < MAXIMUM_RESUME_ATTEMPTS
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::TimedOut
+                        ) =>
+                {
                     offset = temporary.file.stream_position()?;
                     generation = generation.advance()?;
                     session.advance_file_transfer(
@@ -503,85 +690,21 @@ mod linux {
         Err(io::Error::other("file transfer retry exhausted"))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn confirm_committed_result(
         session: &Session,
-        offer: &vivid_sdk::FileDropOffer,
-        transfer_id: u64,
-        mut generation: FileTransferGeneration,
-        maximum_record_body: u32,
         sha256: [u8; 32],
-        mut result: FileResult,
-        mut channel: vivid_sdk::IncomingFileTransfer,
+        result: FileResult,
+        channel: vivid_sdk::IncomingFileTransfer,
     ) -> io::Result<()> {
-        for attempt in 0..MAXIMUM_RESUME_ATTEMPTS {
-            let _ = channel.send_result(&result);
-            for _ in 0..3 {
-                if let Ok(status) = session.query_file_drop(
-                    QueryFileDrop {
-                        drop_id: offer.binding.drop_id,
-                    },
-                    &RequestMetadata::default(),
-                ) && status.state == FileDropState::Committed
-                    && status.final_name == result.final_name
-                    && status.committed_offset == offer.declared_length
-                {
-                    return Ok(());
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            if attempt + 1 == MAXIMUM_RESUME_ATTEMPTS {
-                break;
-            }
-            let previous = generation;
-            generation = generation.advance()?;
-            session.advance_file_transfer(
-                AdvanceFileTransfer {
-                    context_id: offer.binding.context_id,
-                    surface_id: offer.binding.surface_id,
-                    drop_id: offer.binding.drop_id,
-                    transfer_id,
-                    expected_generation: previous,
-                    new_generation: generation,
-                    committed_offset: offer.declared_length,
-                    maximum_body_bytes: CREDIT_WINDOW_BYTES,
-                    maximum_records: CREDIT_WINDOW_RECORDS,
-                },
-                &RequestMetadata::default(),
-            )?;
-            channel = session.open_incoming_file_transfer(IncomingFileTransferRequest {
-                context_id: offer.binding.context_id,
-                surface_id: offer.binding.surface_id,
-                producer_epoch: offer.binding.producer_epoch,
-                grant_generation: offer.binding.grant_generation,
-                surface_generation: offer.binding.surface_generation,
-                drop_id: offer.binding.drop_id,
-                transfer_id,
-                transfer_generation: generation,
-                resume_offset: offer.declared_length,
-                declared_length: offer.declared_length,
-                maximum_record_body,
-                maximum_body_bytes: CREDIT_WINDOW_BYTES,
-                maximum_records: CREDIT_WINDOW_RECORDS,
-            })?;
-            match channel.read_event()? {
-                IncomingFileTransferEvent::Finished(finish) if finish.sha256 == sha256 => {}
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "completed transfer replay was not an identical finish",
-                    ));
-                }
-            }
-            result.transfer_generation = generation;
-            result.result = FileResultCode::AlreadyCommitted;
-            // `committed_path` is deliberately left alone: spec section 6 requires the replayed
-            // already-committed result to carry the byte-identical path, so the presenter types
-            // it exactly once no matter how many results were lost.
-        }
-        Err(io::Error::other(
-            "could not reconcile the committed file result",
-        ))
+        let request = channel.request();
+        let mut committed = crate::CommittedFileDrop {
+            final_name: result.final_name.clone(),
+            result,
+            channel,
+            request,
+            sha256,
+        };
+        crate::reconcile_committed_pending(session, &mut committed)
     }
 
     struct FinishedGeneration {
@@ -604,10 +727,8 @@ mod linux {
         file: &mut File,
         hasher: &mut Sha256,
     ) -> io::Result<FinishedGeneration> {
-        let mut received_body = 0_u64;
-        let mut received_records = 0_u64;
-        let mut maximum_body = CREDIT_WINDOW_BYTES;
-        let mut maximum_records = CREDIT_WINDOW_RECORDS;
+        let mut credit = crate::Credit::new(channel.request());
+        credit.start(&mut channel)?;
         loop {
             match channel.read_event()? {
                 IncomingFileTransferEvent::Data { offset, bytes } => {
@@ -617,32 +738,11 @@ mod linux {
                             "temporary offset mismatch",
                         ));
                     }
-                    file.write_all(&bytes)?;
-                    hasher.update(&bytes);
-                    received_body = received_body
-                        .checked_add(bytes.len() as u64 + 16)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "credit overflow")
-                        })?;
-                    received_records = received_records.checked_add(1).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "credit overflow")
-                    })?;
-                    if maximum_body.saturating_sub(received_body) < 4 * u64::from(RECORD_BODY)
-                        || maximum_records.saturating_sub(received_records) < 4
-                    {
-                        maximum_body =
-                            maximum_body
-                                .checked_add(CREDIT_WINDOW_BYTES)
-                                .ok_or_else(|| {
-                                    io::Error::new(io::ErrorKind::InvalidData, "credit overflow")
-                                })?;
-                        maximum_records = maximum_records
-                            .checked_add(CREDIT_WINDOW_RECORDS)
-                            .ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::InvalidData, "credit overflow")
-                            })?;
-                        channel.grant(maximum_body, maximum_records)?;
+                    if let Err(error) = crate::write_hashed(file, hasher, &bytes) {
+                        crate::failure_result(&channel, FileResultCode::IoError);
+                        return Err(io::Error::other(error));
                     }
+                    credit.received(bytes.len(), &mut channel)?;
                 }
                 IncomingFileTransferEvent::Finished(finish) => {
                     return Ok(FinishedGeneration {
@@ -660,41 +760,9 @@ mod linux {
         }
     }
 
-    /// Open the XDG Desktop directory without following the final path component.
-    pub fn open_xdg_desktop() -> io::Result<File> {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is unavailable"))?;
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .unwrap_or_else(|| home.join(".config"))
-            .join("user-dirs.dirs");
-        let desktop = std::fs::read_to_string(config)
-            .ok()
-            .and_then(|content| {
-                content.lines().find_map(|line| {
-                    let value = line.strip_prefix("XDG_DESKTOP_DIR=")?.trim();
-                    let value = value.strip_prefix('"')?.strip_suffix('"')?;
-                    Some(PathBuf::from(value.replace("$HOME", home.to_str()?)))
-                })
-            })
-            .unwrap_or_else(|| home.join("Desktop"));
-        if !desktop.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "XDG Desktop is not absolute",
-            ));
-        }
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(desktop)
-    }
-
     struct TemporaryFile {
         directory: File,
+        directory_path: Option<PathBuf>,
         file: File,
         temporary_name: String,
         suggested_name: String,
@@ -706,15 +774,10 @@ mod linux {
             let mut random = [0_u8; 16];
             getrandom::fill(&mut random).map_err(io::Error::other)?;
             let temporary_name = format!(".vivid-drop-{}", hex(&random));
-            let path = directory_path(&directory).join(&temporary_name);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
+            let (file, directory_path) = os::create_temporary_file(&directory, &temporary_name)?;
             Ok(Self {
                 directory,
+                directory_path,
                 file,
                 temporary_name,
                 suggested_name: suggested_name.to_owned(),
@@ -722,22 +785,16 @@ mod linux {
             })
         }
 
-        fn commit(mut self) -> io::Result<String> {
+        fn commit(&mut self) -> io::Result<String> {
             for collision in 0..10_000_u32 {
                 let candidate = crate::collision_name(&self.suggested_name, collision);
-                match renameat_with(
-                    self.directory.as_fd(),
-                    Path::new(&self.temporary_name),
-                    self.directory.as_fd(),
-                    Path::new(&candidate),
-                    RenameFlags::NOREPLACE,
-                ) {
-                    Ok(()) => {
+                match os::commit_temporary(&self.directory, &self.temporary_name, &candidate) {
+                    Ok(true) => {
                         self.committed = true;
                         return Ok(candidate);
                     }
-                    Err(error) if error == rustix::io::Errno::EXIST => continue,
-                    Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
+                    Ok(false) => continue,
+                    Err(error) => return Err(error),
                 }
             }
             Err(io::Error::new(
@@ -750,42 +807,13 @@ mod linux {
     impl Drop for TemporaryFile {
         fn drop(&mut self) {
             if !self.committed {
-                let _ = std::fs::remove_file(
-                    directory_path(&self.directory).join(&self.temporary_name),
+                os::remove_temporary_file(
+                    &self.directory,
+                    self.directory_path.as_ref(),
+                    &self.temporary_name,
                 );
             }
         }
-    }
-
-    fn open_shell_cwd(pid: u32) -> io::Result<File> {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(format!("/proc/{pid}/cwd"))
-    }
-
-    fn directory_path(directory: &File) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-    }
-
-    /// Resolve a retained destination directory handle to its absolute path, or nothing.
-    ///
-    /// Every failure mode degrades to the pre-`file-drop-path-v1` behavior of disclosing no path
-    /// at all: an unreadable link, a relative or already-unlinked target, non-UTF-8 bytes, or a
-    /// path that could never pass the protocol validator anyway. A Linux directory name may
-    /// legally contain a newline, so the control-character check is not decoration.
-    fn resolve_directory(directory: &File) -> Option<PathBuf> {
-        let target = std::fs::read_link(directory_path(directory)).ok()?;
-        let text = target.to_str()?;
-        if !text.starts_with('/')
-            || text.ends_with(" (deleted)")
-            || text.len() >= MAX_COMMITTED_PATH_BYTES
-            || text.chars().any(char::is_control)
-            || text.split('/').any(|component| component == "..")
-        {
-            return None;
-        }
-        Some(target)
     }
 
     /// Join a resolved destination directory to a committed basename, if the result is safe.
@@ -802,17 +830,15 @@ mod linux {
         Some(text)
     }
 
-    fn process_start_time(pid: u32) -> io::Result<u64> {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
-        let end = stat
-            .rfind(')')
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid proc stat"))?;
-        stat[end + 2..]
-            .split_ascii_whitespace()
-            .nth(19)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "proc start time is absent"))?
-            .parse()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid proc start time"))
+    fn ensure_shell(pid: u32, start: u64) -> io::Result<()> {
+        if process_start_time(pid).is_ok_and(|current| current == start) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "login shell exited",
+            ))
+        }
     }
 
     fn parse_shell_pid() -> io::Result<(u32, bool)> {
@@ -860,6 +886,7 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::os::unix::fs::OpenOptionsExt;
 
         #[test]
         fn collision_suffix_preserves_extension() {
@@ -873,16 +900,34 @@ mod linux {
             assert!(process_start_time(std::process::id()).unwrap() > 0);
         }
 
+        #[test]
+        fn exited_unreaped_shell_is_not_live() {
+            use std::process::{Command, Stdio};
+            let mut child = Command::new("sh")
+                .args(["-c", "read value"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let start = process_start_time(child.id()).unwrap();
+            drop(child.stdin.take());
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while ensure_shell(child.id(), start).is_ok() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.wait().unwrap();
+        }
+
         fn scratch(name: &str) -> PathBuf {
             let path =
                 std::env::temp_dir().join(format!("vvreceive-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
-            path
+            std::fs::canonicalize(&path).unwrap_or(path)
         }
 
-        fn open_directory(path: &Path) -> File {
-            OpenOptions::new()
+        fn open_directory(path: &std::path::Path) -> File {
+            std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
                 .open(path)
@@ -907,17 +952,42 @@ mod linux {
         }
 
         #[test]
+        fn commit_reports_renamed_directory_and_preserves_existing_file() {
+            let root = scratch("renamed");
+            let old = root.join("old");
+            let new = root.join("new");
+            std::fs::create_dir(&old).unwrap();
+            let mut temporary = TemporaryFile::create(open_directory(&old), "report.txt").unwrap();
+            std::io::Write::write_all(&mut temporary.file, b"received").unwrap();
+            std::fs::write(old.join("report.txt"), b"original").unwrap();
+            std::fs::rename(&old, &new).unwrap();
+            std::fs::create_dir(&old).unwrap();
+            let name = temporary.commit().unwrap();
+            assert_eq!(name, "report (1).txt");
+            let resolved = resolve_directory(&temporary.directory);
+            assert_eq!(
+                committed_path(resolved.as_ref(), &name),
+                Some(new.join(&name).to_str().unwrap().to_owned())
+            );
+            assert_eq!(std::fs::read(new.join(name)).unwrap(), b"received");
+            assert_eq!(std::fs::read(new.join("report.txt")).unwrap(), b"original");
+            assert_eq!(std::fs::read_dir(&old).unwrap().count(), 0);
+            drop(temporary);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn an_unlinked_directory_discloses_nothing() {
             let path = scratch("unlinked");
             let directory = open_directory(&path);
             std::fs::remove_dir_all(&path).unwrap();
-            // The kernel appends " (deleted)", which is not a path anyone should be typing.
+            // On Linux the kernel appends " (deleted)". On macOS fcntl fails or is unlinked.
             assert!(resolve_directory(&directory).is_none());
         }
 
         #[test]
         fn a_directory_name_that_cannot_be_disclosed_safely_yields_nothing() {
-            // A Linux directory name may hold a newline; such a path must never reach a terminal.
+            // A directory name may hold a newline; such a path must never reach a terminal.
             let path = scratch("control").join("in\nvalid");
             std::fs::create_dir_all(&path).unwrap();
             let directory = open_directory(&path);
@@ -939,10 +1009,12 @@ mod linux {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub use platform::open_macos_desktop;
 #[cfg(target_os = "linux")]
-pub use linux::open_xdg_desktop;
-#[cfg(target_os = "linux")]
-pub use linux::run;
+pub use platform::open_xdg_desktop;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use platform::run;
 
 #[cfg(test)]
 mod portable_tests {
@@ -953,3 +1025,6 @@ mod portable_tests {
         assert!(super::collision_name(&format!("{}.txt", "é".repeat(126)), 1).len() <= 255);
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;
