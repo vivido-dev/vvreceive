@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.10"
+version = "1.5.11"
 dependencies = [
  "getrandom",
  "vivid_protocol",
